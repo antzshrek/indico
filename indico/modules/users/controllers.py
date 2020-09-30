@@ -7,20 +7,21 @@
 
 from __future__ import unicode_literals
 
-import os
 from collections import namedtuple
 from io import BytesIO
 from operator import attrgetter, itemgetter
 
 from dateutil.relativedelta import relativedelta
-from flask import flash, jsonify, redirect, request, session
+from flask import flash, jsonify, redirect, render_template, request, session
 from markupsafe import Markup, escape
 from marshmallow import fields
+from marshmallow_enum import EnumField
 from PIL import Image
 from sqlalchemy.orm import joinedload, load_only, subqueryload, undefer
 from sqlalchemy.orm.exc import StaleDataError
 from webargs import validate
 from werkzeug.exceptions import BadRequest, Forbidden, NotFound
+from werkzeug.http import parse_date
 
 from indico.core import signals
 from indico.core.auth import multipass
@@ -39,21 +40,21 @@ from indico.modules.events import Event
 from indico.modules.events.util import serialize_event_for_ical
 from indico.modules.users import User, logger, user_management_settings
 from indico.modules.users.forms import (AdminAccountRegistrationForm, AdminsForm, AdminUserSettingsForm, MergeForm,
-                                        SearchForm, UserDetailsForm, UserEmailsForm, UserPictureForm,
-                                        UserPreferencesForm)
+                                        SearchForm, UserDetailsForm, UserEmailsForm, UserPreferencesForm)
 from indico.modules.users.models.emails import UserEmail
+from indico.modules.users.models.users import ProfilePictureSource
 from indico.modules.users.operations import create_user
-from indico.modules.users.util import (get_linked_events, get_picture_data, get_related_categories,
-                                       get_suggested_categories, merge_users, search_users, serialize_user)
-from indico.modules.users.views import WPUser, WPUserDashboard, WPUsersAdmin
+from indico.modules.users.util import (get_gravatar_for_user, get_linked_events, get_related_categories,
+                                       get_suggested_categories, merge_users, search_users, serialize_user,
+                                       set_user_avatar)
+from indico.modules.users.views import WPUser, WPUserDashboard, WPUserProfilePic, WPUsersAdmin
 from indico.util.date_time import now_utc
 from indico.util.event import truncate_path
-from indico.util.fs import secure_filename
 from indico.util.i18n import _
 from indico.util.images import square
 from indico.util.marshmallow import HumanizedDate, Principal, validate_with_message
 from indico.util.signals import values_from_signal
-from indico.util.string import crc32, make_unique_token
+from indico.util.string import make_unique_token
 from indico.web.args import use_kwargs
 from indico.web.flask.templating import get_template_module
 from indico.web.flask.util import send_file, url_for
@@ -185,65 +186,103 @@ class RHPersonalData(RHUserBase):
     def _process(self):
         form = UserDetailsForm(obj=FormDefaults(self.user, skip_attrs={'title'}, title=self.user._title),
                                synced_fields=self.user.synced_fields, synced_values=self.user.synced_values)
-        pic_form = UserPictureForm()
         if form.validate_on_submit():
             self.user.synced_fields = form.synced_fields
             form.populate_obj(self.user, skip=self.user.synced_fields)
             self.user.synchronize_data(refresh=True)
             flash(_('Your personal data was successfully updated.'), 'success')
             return redirect(url_for('.user_profile'))
-        elif self.user.has_picture:
-            pic_form.picture.data = self.user
-        return WPUser.render_template('personal_data.html', 'personal_data', user=self.user, form=form,
-                                      pic_form=pic_form)
+        return WPUser.render_template('personal_data.html', 'personal_data', user=self.user, form=form)
+
+
+class RHProfilePicturePage(RHUserBase):
+    """Page to manage the profile picture."""
+
+    def _process(self):
+        return WPUserProfilePic.render_template('profile_picture.html', 'profile_picture',
+                                                user=self.user, source=self.user.picture_source.name)
+
+
+class RHProfilePicturePreview(RHUserBase):
+    """Preview the different profile pictures.
+
+    This always uses a fresh picture without any caching.
+    """
+
+    @use_kwargs({
+        'source': EnumField(ProfilePictureSource, location='view_args')
+    })
+    def _process(self, source):
+        if source == ProfilePictureSource.standard:
+            first_name = self.user.first_name[0].upper() if self.user.first_name else ''
+            avatar = render_template('users/avatar.svg', bg_color=self.user.avatar_bg_color, text=first_name)
+            return send_file('avatar.svg', BytesIO(avatar.encode('utf-8')), mimetype='image/svg+xml',
+                             no_cache=True, inline=True, safe=False)
+        elif source == ProfilePictureSource.custom:
+            metadata = self.user.picture_metadata
+            return send_file('avatar.png', BytesIO(self.user.picture), mimetype=metadata['content_type'],
+                             no_cache=True, inline=True)
+        else:
+            gravatar = get_gravatar_for_user(self.user, source == ProfilePictureSource.identicon, size=80)[0]
+            return send_file('avatar.png', BytesIO(gravatar), mimetype='image/png')
 
 
 class RHProfilePictureDisplay(RHUserBase):
+    """Display the user's profile picture."""
+
+    allow_system_user = True
+
     def _process(self):
-        if not self.user.has_picture:
-            raise NotFound
+        if self.user.picture_source == ProfilePictureSource.standard:
+            first_name = self.user.first_name[0].upper() if self.user.first_name else ''
+            avatar = render_template('users/avatar.svg', bg_color=self.user.avatar_bg_color, text=first_name)
+            return send_file('avatar.svg', BytesIO(avatar.encode('utf-8')), mimetype='image/svg+xml',
+                             no_cache=False, inline=True, safe=False, cache_timeout=(86400*7))
+
         metadata = self.user.picture_metadata
-        return send_file('user.png', BytesIO(self.user.picture), mimetype=metadata['content_type'],
-                         conditional=True)
+        return send_file('avatar.png', BytesIO(self.user.picture), mimetype=metadata['content_type'],
+                         inline=True, conditional=True, last_modified=parse_date(metadata['lastmod']),
+                         cache_timeout=(86400*7))
 
 
-class RHProfilePicture(RHUserBase):
-    def _process(self):
-        f = request.files['picture']
-        try:
-            pic = Image.open(f)
-        except IOError:
-            raise UserValueError(_('You cannot upload this file as profile picture.'))
-        if pic.format.lower() not in {'jpeg', 'png', 'gif'}:
-            raise UserValueError(_('The file has an invalid format ({format}).').format(format=pic.format))
-        if pic.mode not in {'RGB', 'RGBA'}:
-            pic = pic.convert('RGB')
-        image_bytes = BytesIO()
-        pic = square(pic)
-        if pic.height > 256:
-            pic = pic.resize((256, 256), resample=Image.BICUBIC)
-        pic.save(image_bytes, 'PNG')
-        image_bytes.seek(0)
-        content = image_bytes.read()
-        self.user.picture = content
-        self.user.picture_metadata = {
-            'hash': crc32(content),
-            'size': len(content),
-            'filename': os.path.splitext(secure_filename(f.filename, 'user'))[0] + '.png',
-            'content_type': 'image/png'
-        }
-        flash(_('Profile picture uploaded'), 'success')
-        logger.info('Profile picture of user %s uploaded by %s', self.user, session.user)
-        return jsonify_data(content=get_picture_data(self.user))
+class RHSaveProfilePicture(RHUserBase):
+    """Update the user's profile picture."""
 
+    @use_kwargs({
+        'source': EnumField(ProfilePictureSource)
+    })
+    def _process(self, source):
+        self.user.picture_source = source
 
-class RHProfilePictureDelete(RHUserBase):
-    def _process(self):
-        self.user.picture = None
-        self.user.picture_metadata = None
-        flash(_('Profile picture deleted'), 'success')
-        logger.info('Profile picture of user %s deleted by %s', self.user, session.user)
-        return jsonify_data(content=None)
+        if source == ProfilePictureSource.standard:
+            self.user.picture = None
+            self.user.picture_metadata = None
+            logger.info('Profile picture of user %s removed by %s', self.user, session.user)
+            return '', 204
+
+        if source == ProfilePictureSource.custom:
+            f = request.files['picture']
+            try:
+                pic = Image.open(f)
+            except IOError:
+                raise UserValueError(_('You cannot upload this file as profile picture.'))
+            if pic.format.lower() not in {'jpeg', 'png', 'gif', 'webp'}:
+                raise UserValueError(_('The file has an invalid format ({format}).').format(format=pic.format))
+            if pic.mode not in ('RGB', 'RGBA'):
+                pic = pic.convert('RGB')
+            pic = square(pic)
+            if pic.height > 256:
+                pic = pic.resize((256, 256), resample=Image.BICUBIC)
+            image_bytes = BytesIO()
+            pic.save(image_bytes, 'PNG')
+            image_bytes.seek(0)
+            set_user_avatar(self.user, image_bytes.read(), f.filename)
+        else:
+            content, lastmod = get_gravatar_for_user(self.user, source == ProfilePictureSource.identicon, 256)
+            set_user_avatar(self.user, content, source.name, lastmod)
+
+        logger.info('Profile picture of user %s updated by %s', self.user, session.user)
+        return '', 204
 
 
 class RHUserPreferences(RHUserBase):
@@ -412,9 +451,14 @@ class RHUserEmailsDelete(RHUserBase):
 
 class RHUserEmailsSetPrimary(RHUserBase):
     def _process(self):
+        from .tasks import update_gravatars
+
         email = request.form['email']
         if email in self.user.secondary_emails:
             self.user.make_email_primary(email)
+            db.session.commit()
+            if self.user.picture_source in (ProfilePictureSource.gravatar, ProfilePictureSource.identicon):
+                update_gravatars.delay(self.user)
             flash(_('Your primary email was updated successfully.'), 'success')
         return redirect(url_for('.user_emails'))
 

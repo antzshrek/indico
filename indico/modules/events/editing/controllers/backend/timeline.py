@@ -11,13 +11,12 @@ import os
 from io import BytesIO
 from zipfile import ZipFile
 
-from flask import request, session
+from flask import jsonify, request, session
 from marshmallow import fields
 from marshmallow_enum import EnumField
 from sqlalchemy.orm import joinedload
 from werkzeug.exceptions import Forbidden, NotFound, ServiceUnavailable
 
-from indico.core.db import db
 from indico.core.errors import UserValueError
 from indico.modules.events.editing.controllers.base import RHContributionEditableBase, TokenAccessMixin
 from indico.modules.events.editing.fields import EditingFilesField, EditingTagsField
@@ -26,12 +25,15 @@ from indico.modules.events.editing.models.revision_files import EditingRevisionF
 from indico.modules.events.editing.models.revisions import EditingRevision, InitialRevisionState
 from indico.modules.events.editing.operations import (assign_editor, confirm_editable_changes, create_new_editable,
                                                       create_revision_comment, create_submitter_revision,
-                                                      delete_editable, delete_revision_comment, replace_revision,
+                                                      delete_revision_comment, ensure_latest_revision,
+                                                      publish_editable_revision, replace_revision,
                                                       review_editable_revision, unassign_editor, undo_review,
                                                       update_revision_comment)
 from indico.modules.events.editing.schemas import (EditableSchema, EditingConfirmationAction, EditingReviewAction,
                                                    ReviewEditableArgs)
-from indico.modules.events.editing.service import ServiceRequestFailed, service_handle_new_editable
+from indico.modules.events.editing.service import (ServiceRequestFailed, service_get_custom_actions,
+                                                   service_handle_custom_action, service_handle_new_editable,
+                                                   service_handle_review_editable)
 from indico.modules.events.editing.settings import editing_settings
 from indico.modules.files.controllers import UploadFileMixin
 from indico.modules.users import User
@@ -81,6 +83,7 @@ class RHContributionEditableRevisionBase(RHContributionEditableBase):
                          .with_parent(self.editable, 'revisions')
                          .filter_by(id=request.view_args['revision_id'])
                          .first_or_404())
+
         if self.revision is None:
             raise NotFound
 
@@ -110,8 +113,49 @@ class RHEditable(RHContributionEditableBase):
         if not self.editable.can_see_timeline(session.user):
             raise Forbidden
 
+    def _get_custom_actions(self):
+        if not editing_settings.get(self.event, 'service_url'):
+            return []
+
+        if (
+            not self.editable.can_perform_submitter_actions(session.user) and
+            not self.editable.can_perform_editor_actions(session.user)
+        ):
+            return []
+
+        try:
+            return service_get_custom_actions(self.editable, self.editable.revisions[-1], session.user)
+        except ServiceRequestFailed:
+            # unlikely to fail, but if it does we don't break the whole timeline
+            return []
+
     def _process(self):
-        return EditableSchema(context={'user': session.user}).jsonify(self.editable)
+        custom_actions = self._get_custom_actions()
+        custom_actions_ctx = {self.editable.revisions[-1]: custom_actions}
+        schema = EditableSchema(context={'user': session.user, 'custom_actions': custom_actions_ctx})
+        return schema.jsonify(self.editable)
+
+
+class RHTriggerExtraRevisionAction(RHContributionEditableRevisionBase):
+    """Trigger an extra action provided by the editing service."""
+
+    def _check_revision_access(self):
+        if not editing_settings.get(self.event, 'service_url'):
+            return False
+        # It's up to the editing service to decide who can do what, so we
+        # just require the user to have more than just read access
+        return (
+            self.editable.can_perform_submitter_actions(session.user) or
+            self.editable.can_perform_editor_actions(session.user)
+        )
+
+    @use_kwargs({
+        'action': fields.String(required=True)
+    })
+    def _process(self, action):
+        ensure_latest_revision(self.revision)
+        resp = service_handle_custom_action(self.editable, self.revision, session.user, action)
+        return jsonify(redirect=resp.get('redirect'))
 
 
 class RHCreateEditable(RHContributionEditableBase):
@@ -138,14 +182,12 @@ class RHCreateEditable(RHContributionEditableBase):
         initial_state = InitialRevisionState.new if service_url else InitialRevisionState.ready_for_review
 
         editable = create_new_editable(self.contrib, self.editable_type, session.user, args['files'], initial_state)
-        db.session.commit()
         if service_url:
             try:
                 service_handle_new_editable(editable)
             except ServiceRequestFailed:
-                delete_editable(editable)
-                db.session.commit()
                 raise ServiceUnavailable(_('Submission failed, please try again later.'))
+
         return '', 201
 
 
@@ -162,7 +204,21 @@ class RHReviewEditable(RHContributionEditableRevisionBase):
             argmap['files'] = EditingFilesField(self.event, self.contrib, self.editable_type, allow_claimed_files=True,
                                                 required=True)
         args = parser.parse(argmap)
-        review_editable_revision(self.revision, session.user, action, comment, args['tags'], args.get('files'))
+        service_url = editing_settings.get(self.event, 'service_url')
+
+        new_revision = review_editable_revision(self.revision, session.user, action, comment, args['tags'],
+                                                args.get('files'))
+
+        publish = True
+        if service_url:
+            try:
+                resp = service_handle_review_editable(self.editable, action, self.revision, new_revision)
+                publish = resp.get('publish', True)
+            except ServiceRequestFailed:
+                raise ServiceUnavailable(_('Failed processing review, please try again later.'))
+
+        if publish and action in (EditingReviewAction.accept, EditingReviewAction.update_accept):
+            publish_editable_revision(new_revision or self.revision)
         return '', 204
 
 
@@ -178,6 +234,18 @@ class RHConfirmEditableChanges(RHContributionEditableRevisionBase):
     })
     def _process(self, action, comment):
         confirm_editable_changes(self.revision, session.user, action, comment)
+
+        service_url = editing_settings.get(self.event, 'service_url')
+        publish = True
+        if service_url:
+            try:
+                resp = service_handle_review_editable(self.editable, action, self.revision)
+                publish = resp.get('publish', True)
+            except ServiceRequestFailed:
+                raise ServiceUnavailable(_('Failed processing review, please try again later.'))
+
+        if publish and action == EditingConfirmationAction.accept:
+            publish_editable_revision(self.revision)
         return '', 204
 
 
@@ -218,7 +286,15 @@ class RHCreateSubmitterRevision(RHContributionEditableRevisionBase):
                                        required=True)
         })
 
-        create_submitter_revision(self.revision, session.user, args['files'])
+        service_url = editing_settings.get(self.event, 'service_url')
+        new_revision = create_submitter_revision(self.revision, session.user, args['files'])
+
+        if service_url:
+            try:
+                service_handle_review_editable(self.editable, EditingReviewAction.update,
+                                               self.revision, new_revision)
+            except ServiceRequestFailed:
+                raise ServiceUnavailable(_('Failed processing review, please try again later.'))
         return '', 204
 
 
@@ -236,6 +312,8 @@ class RHUndoReview(RHContributionEditableRevisionBase):
 class RHCreateRevisionComment(RHContributionEditableRevisionBase):
     """Create new revision comment"""
 
+    SERVICE_ALLOWED = True
+
     def _check_revision_access(self):
         return self.editable.can_comment(session.user)
 
@@ -244,9 +322,13 @@ class RHCreateRevisionComment(RHContributionEditableRevisionBase):
         'internal': fields.Bool(missing=False)
     })
     def _process(self, text, internal):
-        if internal and not self.editable.can_use_internal_comments(session.user):
+        user = session.user
+        if self.is_service_call:
+            user = User.get_system_user()
+        elif internal and not self.editable.can_use_internal_comments(session.user):
             internal = False
-        create_revision_comment(self.revision, session.user, text, internal)
+
+        create_revision_comment(self.revision, user, text, internal)
         return '', 201
 
 

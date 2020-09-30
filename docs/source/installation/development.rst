@@ -72,6 +72,8 @@ We will need a virtualenv where to run Indico::
     virtualenv env -p /usr/bin/python2.7
 
 
+.. _cloning:
+
 Cloning Indico
 --------------
 
@@ -122,6 +124,8 @@ Creating the DB
     createdb indico -T indico_template
 
 
+.. _configuring-dev:
+
 Configuring
 -----------
 
@@ -143,6 +147,14 @@ You can then initialize the DB::
 
     indico db prepare
 
+To build the locales, use:
+
+.. code-block:: shell
+
+    indico i18n compile-catalog
+    indico i18n compile-catalog-react
+
+.. _run-dev:
 
 Running Indico
 --------------

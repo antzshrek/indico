@@ -36,9 +36,9 @@ user_settings = UserSettingsProxy('users', {
     'name_format': NameFormat.first_last,
     'use_previewer_pdf': True,
     'synced_fields': None,  # None to synchronize all fields, empty set to not synchronize
-    'suggest_categories': False  # whether the user should receive category suggestions
+    'suggest_categories': False,  # whether the user should receive category suggestions
 }, converters={
-    'name_format': EnumConverter(NameFormat)
+    'name_format': EnumConverter(NameFormat),
 })
 
 user_management_settings = SettingsProxy('user_management', {
@@ -62,9 +62,11 @@ def _extend_admin_menu(sender, **kwargs):
 def _sidemenu_items(sender, user, **kwargs):
     yield SideMenuItem('dashboard', _('Dashboard'), url_for('users.user_dashboard'), 100, disabled=user.is_system)
     yield SideMenuItem('personal_data', _('Personal data'), url_for('users.user_profile'), 90)
-    yield SideMenuItem('emails', _('Emails'), url_for('users.user_emails'), 80, disabled=user.is_system)
-    yield SideMenuItem('preferences', _('Preferences'), url_for('users.user_preferences'), 70, disabled=user.is_system)
-    yield SideMenuItem('favorites', _('Favourites'), url_for('users.user_favorites'), 60, disabled=user.is_system)
+    yield SideMenuItem('profile_picture', _('Profile picture'), url_for('users.user_profile_picture_page'), 80,
+                       disabled=user.is_system)
+    yield SideMenuItem('emails', _('Emails'), url_for('users.user_emails'), 70, disabled=user.is_system)
+    yield SideMenuItem('preferences', _('Preferences'), url_for('users.user_preferences'), 60, disabled=user.is_system)
+    yield SideMenuItem('favorites', _('Favourites'), url_for('users.user_favorites'), 50, disabled=user.is_system)
 
 
 @signals.menu.items.connect_via('top-menu')
@@ -88,3 +90,8 @@ def _registered(user, identity, from_moderation, **kwargs):
         return
     tpl = get_template_module('users/emails/profile_registered_admins.txt', user=user)
     send_email(make_email(get_admin_emails(), template=tpl))
+
+
+@signals.import_tasks.connect
+def _import_tasks(sender, **kwargs):
+    import indico.modules.users.tasks  # noqa: F401

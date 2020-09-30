@@ -2,10 +2,27 @@ Changelog
 =========
 
 
+Version 2.3.1
+-------------
+
+*Unreleased*
+
+Improvements
+^^^^^^^^^^^^
+
+- Generate material packages in a background task to avoid timeouts or using excessive
+  amounts of disk space in case of people submitting several times (:pr:`4630`)
+
+Bugfixes
+^^^^^^^^
+
+- Only show the warning about draft mode in a conference if it actually has any
+  contributions or timetable entries
+
 Version 2.3
 -----------
 
-*Unreleased*
+*Released on September 14, 2020*
 
 .. note::
 
@@ -33,6 +50,11 @@ Major Features
   the final version on the page of the corresponding contribution. The Editing module
   can also be connected to an external microservice to handle more advanced workflows
   beyond what is supported natively by Indico.
+
+Internationalization
+^^^^^^^^^^^^^^^^^^^^
+
+- New translation: Chinese (Simplified)
 
 Improvements
 ^^^^^^^^^^^^
@@ -142,6 +164,7 @@ Bugfixes
 - Fix empty entries in corresponding authors (:pr:`4604`)
 - Actually prevent users from editing registrations if modification is
   disabled
+- Handle LaTeX images with broken redirects (:pr:`4623`, thanks :user:`bcc`)
 
 Internal Changes
 ^^^^^^^^^^^^^^^^
@@ -173,6 +196,9 @@ Internal Changes
 - Add ``extra-registration-settings`` template hook (:pr:`4596`, thanks
   :user:`meluru`)
 - Allow extending polymorphic models in plugins (:pr:`4608`, thanks
+  :user:`omegak`)
+- Wrap registration form AngularJS directive in jinja block for more easily
+  overriding arguments passed to the app in plugins (:pr:`4624`, thanks
   :user:`omegak`)
 
 

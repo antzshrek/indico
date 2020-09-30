@@ -8,6 +8,7 @@
 from __future__ import unicode_literals
 
 import itertools
+from enum import Enum
 from operator import attrgetter
 from uuid import uuid4
 
@@ -57,6 +58,13 @@ class NameFormat(RichIntEnum):
     last_first_upper = 5
     last_f_upper = 6
     f_last_upper = 7
+
+
+class ProfilePictureSource(int, Enum):
+    standard = 0
+    identicon = 1
+    gravatar = 2
+    custom = 3
 
 
 class PersonMixin(object):
@@ -265,6 +273,12 @@ class User(PersonMixin, db.Model):
         JSONB,
         nullable=False,
         default=lambda: None
+    )
+    #: user profile picture source
+    picture_source = db.Column(
+        PyIntEnum(ProfilePictureSource),
+        nullable=False,
+        default=ProfilePictureSource.standard,
     )
 
     _affiliation = db.relationship(
@@ -532,7 +546,8 @@ class User(PersonMixin, db.Model):
 
     @property
     def picture_url(self):
-        return url_for('users.profile_picture_display', self, slug=self.picture_metadata['hash'])
+        slug = self.picture_metadata['hash'] if self.picture_metadata else 'default'
+        return url_for('users.user_profile_picture_display', self, slug=slug)
 
     def __contains__(self, user):
         """Convenience method for `user in user_or_group`."""
